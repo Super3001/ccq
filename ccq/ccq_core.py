@@ -4,7 +4,7 @@
 并提供 session 定位(主文件 + 子 agent 文件)。
 
 可被其它 ccq 模块 import,也可作为 agent 直接写脚本的逃生口:
-    from scripts.ccq_core import load_session, Event, locate
+    from ccq.ccq_core import load_session, Event, locate
 """
 from __future__ import annotations
 

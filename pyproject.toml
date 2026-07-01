@@ -6,11 +6,11 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-ccq = "scripts.ccq:main"
+ccq = "ccq.ccq:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["scripts"]
+packages = ["ccq"]
