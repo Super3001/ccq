@@ -9,6 +9,8 @@ agent 做了什么、遇到什么错误,并评估「agent 使用某 skill 的效
     ccq <selector|path> overview     # 一屏看懂
     ccq <selector|path> timeline     # 紧凑事件流
     ccq <selector|path> human|tools|errors|agents|skills
+    ccq <selector|path> files        # 读写文件统计:R只读/A创建/M修改,子agent分列
+                                     #   加 -L 统计变更行数(+增/−删,较耗时)
     ccq <selector|path> show <seq>   # 钻取单事件完整内容
     ccq <selector|path> grep <regex> [in|io]  # 正则统计:出现次数+命中事件+动作分布
                                               # scope 缺省 io(人机所写+环境返回),in 只搜人机所写
@@ -29,17 +31,21 @@ agent 做了什么、遇到什么错误,并评估「agent 使用某 skill 的效
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
+from enum import IntEnum
 from pathlib import Path
 
 # 模块级 verbosity:0=quiet,1=normal(默认),2=verbose
 _QUIET = False
 _VERBOSE = False
+# files 动词:是否统计变更行数(+增/−删)。较耗时(每次 Edit 一趟 difflib),默认关。
+_COUNT_LINES = False
 
-from .ccq_core import (
+from ccq.ccq_core import (
     Event, Kind, SessionFiles, list_sessions, load_session, locate,
     projects_root, _codex_skill_names,
 )
@@ -456,6 +462,261 @@ def cmd_grep(ev: list[Event], pattern: str, scope: str = "io") -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Layer F: files —— 会话读写文件统计 (R 只读 / A 创建 / M 修改)
+# --------------------------------------------------------------------------- #
+class FCat(IntEnum):
+    """一个文件在某 agent 作用域内的最终归类。"""
+    R = 0   # 只读:只被 Read,从未改动
+    A = 1   # 创建:会话内新建(首次改动是无前置读的 Write,或 apply_patch Add)
+    M = 2   # 修改:会话内改动既有文件(Edit,或改前读过的 Write,或 apply_patch Update)
+    D = 3   # 删除:仅 Codex apply_patch Delete File(存在才展示)
+
+
+_FCAT_LABEL = {FCat.R: "R 只读", FCat.A: "A 创建", FCat.M: "M 修改", FCat.D: "D 删除"}
+
+# 结构化文件工具(Claude 侧)。Bash/shell 里的 cat、> 重定向等不透明,不纳入。
+_READ_TOOLS = {"Read"}
+_WRITE_TOOLS = {"Write"}                       # 覆盖写:文件可能新建也可能既有
+_EDIT_TOOLS = {"Edit", "MultiEdit", "NotebookEdit"}   # 就地改:文件必然既有
+
+
+def _file_path_of(e: Event) -> str | None:
+    inp = e.tool_input if isinstance(e.tool_input, dict) else None
+    if inp is None:
+        return None
+    return inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+
+
+def _seq_churn(old: str, new: str) -> tuple[int, int]:
+    """两段文本的行级变更量 (+增, −删)。replace 两侧都计入(即 churn,非净值)。"""
+    a = d = 0
+    sm = difflib.SequenceMatcher(None, old.splitlines(), new.splitlines())
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace":
+            d += i2 - i1
+            a += j2 - j1
+        elif tag == "delete":
+            d += i2 - i1
+        elif tag == "insert":
+            a += j2 - j1
+    return a, d
+
+
+def _parse_apply_patch(patch: str, count_lines: bool) -> list[tuple[str, str, int, int]]:
+    """解析 Codex apply_patch → [(verb, path, adds, dels)]。verb ∈ Add/Update/Delete。
+    count_lines=False 时仅取 (verb, path),不数 +/- 行(adds=dels=0)。"""
+    out: list[tuple[str, str, int, int]] = []
+    cur: tuple[str, str] | None = None
+    a = d = 0
+
+    def flush() -> None:
+        nonlocal cur, a, d
+        if cur:
+            out.append((cur[0], cur[1], a, d))
+        cur, a, d = None, 0, 0
+
+    for line in (patch or "").splitlines():
+        m = re.match(r"\*\*\*\s+(Add|Update|Delete)\s+File:\s+(.+?)\s*$", line)
+        if m:
+            flush()
+            cur = (m.group(1), m.group(2).strip())
+            continue
+        if line.startswith("*** "):     # *** Begin/End Patch 等分节标记
+            flush()
+            continue
+        if cur is None or not count_lines:
+            continue
+        if line.startswith("+"):
+            a += 1
+        elif line.startswith("-"):
+            d += 1
+    flush()
+    return out
+
+
+# 一条文件操作:(seq, op, adds, dels)。op ∈ {R,W,E,ADD,UPD,DEL};adds/dels 仅在
+# _COUNT_LINES 且该操作属「精确可计」的前三种场景时非零。
+def _collect_file_ops(events: list[Event]) -> dict[str, list[tuple[int, str, int, int]]]:
+    """作用域内每个文件的操作序列:path → [(seq, op, adds, dels)],按 seq 排序。"""
+    ops: dict[str, list[tuple[int, str, int, int]]] = defaultdict(list)
+    cl = _COUNT_LINES
+    for e in events:
+        if e.kind != Kind.TOOL:
+            continue
+        name = e.tool_name or ""
+        inp = e.tool_input if isinstance(e.tool_input, dict) else {}
+        if name in _READ_TOOLS:
+            p = _file_path_of(e)
+            if p:
+                ops[p].append((e.seq, "R", 0, 0))
+        elif name in _WRITE_TOOLS:
+            p = _file_path_of(e)
+            if p:
+                # 新增行数;是否计入由 _classify 按最终归类(仅 A 新建)决定
+                a = len((inp.get("content") or "").splitlines()) if cl else 0
+                ops[p].append((e.seq, "W", a, 0))
+        elif name in _EDIT_TOOLS:
+            p = _file_path_of(e)
+            if p:
+                a = d = 0
+                if cl:
+                    if name == "Edit":
+                        a, d = _seq_churn(inp.get("old_string") or "",
+                                          inp.get("new_string") or "")
+                    elif name == "MultiEdit":
+                        for ed in (inp.get("edits") or []):
+                            if isinstance(ed, dict):
+                                aa, dd = _seq_churn(ed.get("old_string") or "",
+                                                    ed.get("new_string") or "")
+                                a += aa
+                                d += dd
+                    # NotebookEdit:无旧内容可比,归 M 但不计行
+                ops[p].append((e.seq, "E", a, d))
+        elif name == "apply_patch":   # Codex:补丁头给出 Add/Update/Delete + 逐行 +/-
+            patch = e.tool_input if isinstance(e.tool_input, str) else inp.get("input", "")
+            for verb, path, a, d in _parse_apply_patch(patch or "", cl):
+                op = {"Add": "ADD", "Update": "UPD", "Delete": "DEL"}[verb]
+                ops[path].append((e.seq, op, a, d))
+    for lst in ops.values():
+        lst.sort()
+    return ops
+
+
+def _classify(ops: dict[str, list[tuple[int, str, int, int]]]
+              ) -> dict[str, tuple[FCat, int, int, int]]:
+    """path → (归类, 操作次数, adds, dels)。按「首个改动操作」定 A/M,无改动则 R。
+    行数只累计前三种精确场景:Edit/MultiEdit、Write 新建、apply_patch Add/Update;
+    Write 覆盖(盲区)与 Delete 不计,adds/dels 保持 0。"""
+    out: dict[str, tuple[FCat, int, int, int]] = {}
+    for path, lst in ops.items():
+        muts = [(s, op) for s, op, _, _ in lst if op != "R"]
+        if not muts:
+            out[path] = (FCat.R, len(lst), 0, 0)
+            continue
+        fseq, fop = muts[0]
+        if fop == "DEL":
+            cat = FCat.D
+        elif fop == "ADD":
+            cat = FCat.A
+        elif fop in ("E", "UPD"):     # Edit/Update:文件必然既有 → 修改
+            cat = FCat.M
+        else:                          # 'W' 覆盖写:改前读过=既有(M),否则新建(A)
+            read_before = any(s < fseq and op == "R" for s, op, _, _ in lst)
+            cat = FCat.M if read_before else FCat.A
+        adds = dels = 0
+        for _, op, a, d in lst:
+            if op in ("E", "ADD", "UPD"):          # 前三种精确场景
+                adds += a
+                dels += d
+            elif op == "W" and cat == FCat.A:       # Write 新建才计;覆盖(M)不计
+                adds += a
+                dels += d
+        out[path] = (cat, len(lst), adds, dels)
+    return out
+
+
+def _render_scope(title: str, cats: dict[str, tuple[FCat, int, int, int]]) -> Counter:
+    """打印一个作用域的 R/A/M(/D)分组明细,返回各类计数 Counter。
+    _COUNT_LINES 开启时,标题带作用域总 churn,每个可计文件带 +增/−删。"""
+    buckets: dict[FCat, list[tuple[str, int, int, int]]] = {c: [] for c in FCat}
+    for path, (c, n, a, d) in cats.items():
+        buckets[c].append((path, n, a, d))
+    counts = Counter({c: len(buckets[c]) for c in FCat})
+    parts = [f"{c.name}{counts[c]}" for c in (FCat.R, FCat.A, FCat.M)]
+    if counts[FCat.D]:
+        parts.append(f"D{counts[FCat.D]}")
+    head = f"{title}   ({' / '.join(parts)}"
+    if _COUNT_LINES:
+        ta = sum(a for _, (c, n, a, d) in cats.items())
+        td = sum(d for _, (c, n, a, d) in cats.items())
+        head += f"   +{ta}/−{td}"
+    print(head + ")")
+    for c in (FCat.R, FCat.A, FCat.M, FCat.D):
+        items = sorted(buckets[c])
+        if not items:
+            continue
+        print(f"  {_FCAT_LABEL[c]} ({len(items)})")
+        for path, n, a, d in items:
+            churn = f"  +{a}/−{d}" if (_COUNT_LINES and (a or d)) else ""
+            opn = f"  ×{n}" if n > 1 else ""
+            print(f"    {path}{churn}{opn}")
+    return counts
+
+
+def _files_json(sf: SessionFiles, main_cats, groups, sub_meta) -> dict:
+    def scope(cats):
+        d = {c.name: [] for c in FCat}
+        for path, (c, n, a, dd) in sorted(cats.items()):
+            item = {"path": path, "ops": n}
+            if _COUNT_LINES:
+                item["added"], item["removed"] = a, dd
+            d[c.name].append(item)
+        if not d["D"]:
+            del d["D"]
+        return d
+    return {
+        "session_id": sf.session_id,
+        "project": sf.project,
+        "main": scope(main_cats),
+        "subagents": [
+            {
+                "agent_type": (sub_meta.get(aid).agent_type if sub_meta.get(aid) else "?"),
+                "agent_id": aid,
+                "description": (sub_meta.get(aid).description if sub_meta.get(aid) else ""),
+                "files": scope(_classify(_collect_file_ops(evs))),
+            }
+            for aid, evs in groups.items()
+        ],
+    }
+
+
+def cmd_files(sf: SessionFiles, ev: list[Event], as_json: bool = False) -> int:
+    """会话读写文件统计。归类 R 只读 / A 创建 / M 修改;
+    子 agent 含在范围内但**独立作用域分别统计、分别展示**(不并入主 agent 数字)。"""
+    main_ev = [e for e in ev if not e.sidechain]
+    main_cats = _classify(_collect_file_ops(main_ev))
+    # 子 agent 事件按 agent_id 分组(每个子 agent 一个独立作用域)
+    groups: dict[str, list[Event]] = defaultdict(list)
+    for e in ev:
+        if e.sidechain and e.agent_id:
+            groups[e.agent_id].append(e)
+    sub_meta = {s.tool_use_id: s for s in sf.subagents}
+
+    if as_json:
+        print(json.dumps(_files_json(sf, main_cats, groups, sub_meta),
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"session {sf.session_id}   project {sf.project}\n")
+    _render_scope("主 agent  文件读写", main_cats)
+
+    if groups:
+        print(f"\n子 agent 文件读写  (分别统计, {len(groups)} 个)")
+        agg: Counter = Counter()
+        for aid, evs in groups.items():
+            s = sub_meta.get(aid)
+            head = f"■ {s.agent_type if s else '?'}"
+            if s and s.description:
+                head += f"  «{_oneline(s.description, 50)}»"
+            print()
+            agg.update(_render_scope(head, _classify(_collect_file_ops(evs))))
+        parts = [f"{c.name}{agg[c]}" for c in (FCat.R, FCat.A, FCat.M)]
+        if agg[FCat.D]:
+            parts.append(f"D{agg[FCat.D]}")
+        print(f"\n# 子 agent 合计: {' / '.join(parts)}")
+
+    print("\n# 仅统计结构化文件工具(Read/Write/Edit/NotebookEdit,Codex apply_patch);"
+          "Bash/shell 里的 cat、> 重定向等不透明,不在范围。")
+    print("# R=只读  A=会话内新建  M=会话内修改(用 Edit,或改前读过)。×n=该文件被操作次数。")
+    if _COUNT_LINES:
+        print("# +增/−删=行级变更量(churn,replace 两侧都计)。仅 Edit/MultiEdit、"
+              "Write 新建、apply_patch Add/Update 精确;Write 覆盖既有文件的行数未知,不计。")
+    else:
+        print("# 加 -L/--lines 统计每个文件的变更行数(+增/−删,较耗时)。")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Layer S: skill-report (核心场景交付)
 # --------------------------------------------------------------------------- #
 def cmd_skill_report(sf: SessionFiles, ev: list[Event], skill: str | None) -> int:
@@ -644,7 +905,7 @@ def cmd_query(sf: SessionFiles, ev: list[Event], q: str) -> int:
 # --------------------------------------------------------------------------- #
 def do_check(codex: bool = False) -> int:
     if codex:
-        from .ccq_core import codex_sessions_root, iter_codex_logs
+        from ccq.ccq_core import codex_sessions_root, iter_codex_logs
         root = codex_sessions_root()
         ok = root.is_dir()
         print(f"[check] codex sessions root: {root}  {'OK' if ok else '缺失'}")
@@ -691,6 +952,8 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="结构化输出(locate)")
     ap.add_argument("-v", "--verbose", action="store_true", help="详细输出(不截断)")
     ap.add_argument("-q", "--quiet", action="store_true", help="精简输出")
+    ap.add_argument("-L", "--lines", action="store_true",
+                    help="files:统计变更行数(+增/−删;仅 Edit/新建 Write/apply_patch,较耗时)")
     ap.add_argument("--codex", action="store_true",
                     help="读 Codex(~/.codex)会话而非 Claude Code 会话;"
                          "selector 主用工作目录(按会话 cwd 反查)")
@@ -698,9 +961,10 @@ def main() -> None:
     ap.add_argument("--validate", metavar="SEL", help="执行后校验某 session 解析完整性")
     ap.add_argument("args", nargs="*", help="locate <sel> | <sel> <verb> [...]")
     ns = ap.parse_args()
-    global _QUIET, _VERBOSE
+    global _QUIET, _VERBOSE, _COUNT_LINES
     _QUIET = ns.quiet
     _VERBOSE = ns.verbose
+    _COUNT_LINES = ns.lines
 
     if ns.check:
         sys.exit(do_check(ns.codex))
@@ -750,6 +1014,8 @@ def main() -> None:
         sys.exit(cmd_agents(sf, ev))
     if verb == "skills":
         sys.exit(cmd_skills(ev))
+    if verb == "files":
+        sys.exit(cmd_files(sf, ev, ns.json))
     if verb == "show":
         sys.exit(cmd_show(ev, int(rest[1])))
     if verb == "grep":
