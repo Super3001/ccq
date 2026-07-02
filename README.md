@@ -1,9 +1,12 @@
-# ccq
+# cc-query
 
 > 分层查询另一个 Claude Code / Codex session 的日志,诊断 agent 干了什么、
 > 遇到什么错误,并评估某个 skill 的使用效果。纯 Python 标准库,无需 jq。
+>
+> 本仓包含两部分:命令行工具 `ccq`,以及配套的 Claude Code skill `cc-query`
+> (让 Claude 在你问「那个 session 怎么了」时自动调 `ccq`)。
 
-## 安装 (Installation)
+## 1. 安装命令行工具 `ccq` (Install the CLI)
 
 ```bash
 # 从 GitHub 直接安装(推荐)——获得全局命令 `ccq`
@@ -17,10 +20,30 @@ uv tool install --editable .
 
 升级:`uv tool upgrade ccq`
 
+## 2. 安装 Skill `cc-query` (Install the skill — optional but recommended)
+
+本仓在 `.claude/skills/cc-query` 里带了一个 Claude Code skill。装上后,你在 Claude Code
+里直接问「d74d 那个 session 为什么构建失败」「昨晚那个 agent 干了啥」之类,Claude 会自动
+触发该 skill 并替你跑 `ccq`,无需手敲命令。**skill 依赖已安装的 `ccq` 命令(见上一步)。**
+
+把 skill 目录拷进你的用户级 skills 目录即可:
+
+```bash
+# macOS / Linux
+cp -r .claude/skills/cc-query ~/.claude/skills/
+
+# Windows (PowerShell)
+Copy-Item -Recurse .claude/skills/cc-query $HOME\.claude\skills\
+```
+
+用法:装好后无需额外配置,在 Claude Code 中用自然语言问某个 session 的情况即可触发;
+skill 内部就是调用下面这些 `ccq` 子命令。
+
 ## 卸载 (Uninstall)
 
 ```bash
-uv tool uninstall ccq
+uv tool uninstall ccq                 # 卸载命令行工具
+rm -rf ~/.claude/skills/cc-query      # 移除 skill(Windows: Remove-Item -Recurse $HOME\.claude\skills\cc-query)
 ```
 
 ---
