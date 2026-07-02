@@ -40,6 +40,45 @@ class Kind(str, Enum):
 
 
 @dataclass
+class Token:
+    """token 消耗的五元建模。各字段互斥,相加即该事件的真实计费口径。
+    - input:       新增 prompt token(不含缓存命中)
+    - output:      模型输出 token(不含单列的 thinking)
+    - cache_read:  命中缓存的 token(每轮重复上下文,按约 0.1x 计费)
+    - cache_write: 新建缓存的 token
+    - thinking:    推理/思考 token。Claude 不单独上报(已并入 output),恒 0;
+                   Codex 取 reasoning_output_tokens。
+    """
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+    thinking: int = 0
+
+    _FIELDS = ("input", "output", "cache_read", "cache_write", "thinking")
+
+    def __add__(self, other: "Token") -> "Token":
+        return Token(*(getattr(self, f) + getattr(other, f) for f in Token._FIELDS))
+
+    def __radd__(self, other):
+        # 支持 sum([...], Token()) 与 sum([...]) 两种写法
+        return self if other == 0 else self.__add__(other)
+
+    @property
+    def total(self) -> int:
+        return sum(getattr(self, f) for f in Token._FIELDS)
+
+    def as_dict(self) -> dict:
+        """非 0 字段的字典(为 0 则不含)。机器可读输出用。"""
+        return {f: v for f in Token._FIELDS if (v := getattr(self, f))}
+
+    def fmt(self) -> str:
+        """五字段展示,为 0 的字段省略;全 0 时显示 '0'。"""
+        shown = [f"{f}={v:,}" for f in Token._FIELDS if (v := getattr(self, f))]
+        return " ".join(shown) if shown else "0"
+
+
+@dataclass
 class Event:
     """一条归一化事件。seq 为该文件内的稳定序号,用于 show <seq> 钻取。"""
     seq: int
@@ -50,14 +89,23 @@ class Event:
     tool_input: Any = None
     tool_use_id: Optional[str] = None
     is_error: Optional[bool] = None
-    tokens_in: int = 0
-    tokens_out: int = 0
+    tokens: Token = field(default_factory=Token)
     sidechain: bool = False
     agent_type: Optional[str] = None  # 该事件所属子 agent 的类型(主 agent 为 None)
     agent_id: Optional[str] = None    # 该事件所属子 agent 的唯一标识(= spawn 的 toolUseId)
     uuid: Optional[str] = None
     parent_uuid: Optional[str] = None
     raw: dict = field(default_factory=dict, repr=False)
+
+    # 向后兼容:旧代码/测试用的两个标量口径。
+    # in = 新增 input + 新建缓存;out = 输出 + 思考。刻意不含 cache_read(每轮重复,累加即天文数字)。
+    @property
+    def tokens_in(self) -> int:
+        return self.tokens.input + self.tokens.cache_write
+
+    @property
+    def tokens_out(self) -> int:
+        return self.tokens.output + self.tokens.thinking
 
     @property
     def epoch(self) -> float:
@@ -155,11 +203,15 @@ def parse_events(path: str | Path, agent_type: Optional[str] = None,
             if t == "assistant":
                 msg = o.get("message", {}) or {}
                 usage = msg.get("usage", {}) or {}
-                # 只算真正新增的 input(prompt + 新建缓存),不累加 cache_read
-                # ——cache_read 是每轮重复的上下文,累加会得到天文数字。
-                tin = (usage.get("input_tokens", 0) or 0) + \
-                      (usage.get("cache_creation_input_tokens", 0) or 0)
-                tout = usage.get("output_tokens", 0) or 0
+                # 五元建模:input/output/缓存读写分开留存。thinking Claude 不单独上报
+                # (已并入 output_tokens),恒 0。整条消息的 usage 只挂在首个子事件上,
+                # 避免同一回合的多个 block 重复计费。
+                tok = Token(
+                    input=usage.get("input_tokens", 0) or 0,
+                    output=usage.get("output_tokens", 0) or 0,
+                    cache_read=usage.get("cache_read_input_tokens", 0) or 0,
+                    cache_write=usage.get("cache_creation_input_tokens", 0) or 0,
+                )
                 first = True
                 for b in (msg.get("content") or []):
                     if not isinstance(b, dict):
@@ -168,8 +220,7 @@ def parse_events(path: str | Path, agent_type: Optional[str] = None,
                     if bt == "text":
                         seq += 1
                         events.append(Event(seq, Kind.AGENT, text=b.get("text", ""),
-                                            tokens_in=tin if first else 0,
-                                            tokens_out=tout if first else 0, **common))
+                                            tokens=tok if first else Token(), **common))
                         first = False
                     elif bt == "thinking":
                         seq += 1
@@ -188,8 +239,7 @@ def parse_events(path: str | Path, agent_type: Optional[str] = None,
                         events.append(Event(seq, Kind.TOOL, text=b.get("name", ""),
                                             tool_name=b.get("name"), tool_input=b.get("input"),
                                             tool_use_id=b.get("id"),
-                                            tokens_out=tout if first else 0,
-                                            tokens_in=tin if first else 0, **common))
+                                            tokens=tok if first else Token(), **common))
                         first = False
 
             elif t == "user":
@@ -658,7 +708,7 @@ def parse_codex_events(path: str | Path) -> list[Event]:
     path = Path(path)
     events: list[Event] = []
     seq = 0
-    prev_in = prev_out = 0   # token 累计基线(total_token_usage 是累计值,取增量)
+    prev = Token()           # token 累计基线(total_token_usage 是累计值,逐字段取增量)
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -695,15 +745,25 @@ def parse_codex_events(path: str | Path) -> list[Event]:
                         events.append(Event(seq, Kind.THINKING, text=txt, **common))
                 elif et == "token_count":
                     tt = (p.get("info") or {}).get("total_token_usage") or {}
-                    # 非缓存新增 input(对齐 Claude 侧不累加 cache_read 的口径)+ output
-                    cur_in = (tt.get("input_tokens", 0) or 0) - (tt.get("cached_input_tokens", 0) or 0)
-                    cur_out = tt.get("output_tokens", 0) or 0
-                    d_in, d_out = max(0, cur_in - prev_in), max(0, cur_out - prev_out)
-                    prev_in, prev_out = max(prev_in, cur_in), max(prev_out, cur_out)
-                    if d_in or d_out:
+                    # 五元建模,各字段互斥:input 扣掉缓存命中、output 扣掉推理,
+                    # cache_read=cached_input、thinking=reasoning_output;Codex 无 cache_write。
+                    reason = tt.get("reasoning_output_tokens", 0) or 0
+                    cached = tt.get("cached_input_tokens", 0) or 0
+                    cur = Token(
+                        input=max(0, (tt.get("input_tokens", 0) or 0) - cached),
+                        output=max(0, (tt.get("output_tokens", 0) or 0) - reason),
+                        cache_read=cached,
+                        thinking=reason,
+                    )
+                    # total_token_usage 是累计值 → 逐字段取增量,基线取历史最大。
+                    delta = Token(*(max(0, getattr(cur, f) - getattr(prev, f))
+                                    for f in Token._FIELDS))
+                    prev = Token(*(max(getattr(prev, f), getattr(cur, f))
+                                   for f in Token._FIELDS))
+                    if delta.total:
                         seq += 1
                         events.append(Event(seq, Kind.META, text="token_count",
-                                            tokens_in=d_in, tokens_out=d_out, **common))
+                                            tokens=delta, **common))
                 elif et == "context_compacted":
                     seq += 1
                     events.append(Event(seq, Kind.SUMMARY, text="context_compacted", **common))

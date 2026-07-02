@@ -23,7 +23,7 @@ agent 做了什么、遇到什么错误,并评估「agent 使用某 skill 的效
 
 --codex: 读 Codex(~/.codex)会话而非 Claude Code 会话。Codex 按日期归档、
   不按目录,故 selector 主用「工作目录」(按各会话 cwd 反查),也支持 rollout
-  uuid 前缀 / latest。所有动词通用(Codex 无子 agent)。
+  uuid 前缀 / latest。所有动词通用。
     ccq --codex sessions C:/w/HomeTrans-CJ   # 该目录下全部 Codex 会话与计数
     ccq --codex C:/w/HomeTrans-CJ overview    # 该目录最近一个 Codex 会话概览
     ccq --codex <uuid前缀> errors
@@ -46,8 +46,8 @@ _VERBOSE = False
 _COUNT_LINES = False
 
 from ccq.ccq_core import (
-    Event, Kind, SessionFiles, list_sessions, load_session, locate,
-    projects_root, _codex_skill_names,
+    Event, Kind, SessionFiles, Token, list_sessions, load_session, locate,
+    parse_events, parse_codex_events, projects_root, _codex_skill_names,
 )
 
 
@@ -188,10 +188,36 @@ def _mtime_str(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
 
 
-def cmd_sessions(selector: str, as_json: bool, codex: bool = False) -> int:
+def _session_digest(sf: SessionFiles, codex: bool = False) -> dict[str, str]:
+    """单个会话的速览摘要:首个真实人类输入 + 末个真实人类输入 + 末个 agent 回复。
+    只解析主会话文件(不含子 agent),避免 sessions 列表逐条全量加载。
+    人类侧沿用 overview 口径(_genuine_humans),排除命令展开/中断等 harness 噪声,
+    这样摘要展示的是真实提问而非 <command-*> 或 $skill 触发文本。
+    末个人类仅在与首个不同(轮次>1)时给出,与 overview 保持一致。"""
+    try:
+        ev = parse_codex_events(sf.main) if codex else parse_events(sf.main)
+    except (OSError, ValueError):
+        return {}
+    humans = _genuine_humans(ev)
+    agents_txt = [e for e in ev if e.kind == Kind.AGENT and not e.sidechain]
+    d: dict[str, str] = {}
+    if humans:
+        d["first_human"] = humans[0].text or ""
+        if len(humans) > 1:
+            d["last_human"] = humans[-1].text or ""
+    if agents_txt:
+        d["last_agent"] = agents_txt[-1].text or ""
+    return d
+
+
+def cmd_sessions(selector: str, as_json: bool, codex: bool = False,
+                 page: int = 1, limit: int = 20) -> int:
     """枚举某项目目录(或关键字)下的全部主会话与子 agent,并给出计数。
     selector 含路径分隔符时按工作目录精确匹配(含 .claude 等子目录会话)。
-    codex=True 时枚举 Codex 会话(按会话 cwd 匹配该目录,无子 agent)。"""
+    codex=True 时枚举 Codex 会话(按会话 cwd 匹配该目录)。
+    默认分页:按 mtime 全局降序只展示最近 limit(=20)条,且只对展示的会话
+    解析速览摘要——摘要要读整份日志,不分页会让大项目每次都全量解析而变慢。
+    page 翻到更早的一页;limit<=0 关闭分页,展示全部。"""
     sessions = list_sessions(selector, codex=codex)
     if not sessions:
         print(f"ccq sessions: 无匹配项目 {selector!r}", file=sys.stderr)
@@ -207,38 +233,75 @@ def cmd_sessions(selector: str, as_json: bool, codex: bool = False) -> int:
     total_main = len(sessions)
     total_sub = sum(len(s.subagents) for s in sessions)
 
+    # 分页:跨项目按 mtime 全局降序取窗口(默认最近一页),摘要只算窗口内会话
+    page = max(1, page)
+    paged = limit > 0
+    flat = sorted(sessions, key=lambda s: s.mtime, reverse=True)
+    start = (page - 1) * limit if paged else 0
+    window = flat[start:start + limit] if paged else flat
+    win_ids = {id(s) for s in window}
+    lo, hi = (start + 1, start + len(window)) if window else (0, 0)
+
     if as_json:
+        proj_objs = []
+        for proj, g in groups.items():
+            win = [s for s in g if id(s) in win_ids]
+            if not win:
+                continue
+            proj_objs.append({
+                "project": proj,
+                "main_sessions": len(g),         # 该项目匹配到的全部主会话数
+                "subagents": sum(len(s.subagents) for s in g),
+                "shown": len(win),               # 本页在该项目下展示的条数
+                "sessions": [
+                    {"session_id": s.session_id,
+                     "mtime": _mtime_str(s.mtime),
+                     "subagents": len(s.subagents),
+                     "main": str(s.main),
+                     "summary": _session_digest(s, codex)}
+                    for s in win
+                ],
+            })
         print(json.dumps({
             "selector": selector,
-            "projects": [
-                {
-                    "project": proj,
-                    "main_sessions": len(g),
-                    "subagents": sum(len(s.subagents) for s in g),
-                    "sessions": [
-                        {"session_id": s.session_id,
-                         "mtime": _mtime_str(s.mtime),
-                         "subagents": len(s.subagents),
-                         "main": str(s.main)}
-                        for s in g
-                    ],
-                }
-                for proj, g in groups.items()
-            ],
+            "pagination": {"page": page, "limit": limit if paged else 0,
+                           "shown": len(window), "start": lo, "end": hi,
+                           "total_main_sessions": total_main},
+            "projects": proj_objs,
             "total_projects": len(groups),
             "total_main_sessions": total_main,
             "total_subagents": total_sub,
         }, ensure_ascii=False, indent=2))
         return 0
 
+    if not window:
+        print(f"# 该页无记录:共 {total_main} 条主会话,每页 {limit},"
+              f"最大页 {max(1, -(-total_main // limit)) if paged else 1}")
+        return 0
+
     for proj, g in groups.items():
+        win = [s for s in g if id(s) in win_ids]
+        if not win:
+            continue
         sub_n = sum(len(s.subagents) for s in g)
         print(f"project {proj}   ({len(g)} 主会话, {sub_n} 子agent)")
-        for s in g:
+        for s in win:
             mark = f"subs {len(s.subagents)}" if s.subagents else "      "
             print(f"  {s.session_id[:8]}  {_mtime_str(s.mtime)}   {mark}")
+            dg = _session_digest(s, codex)
+            if dg.get("first_human"):
+                print(f"      首 human: {_oneline(dg['first_human'], 100)}")
+            if dg.get("last_human"):
+                print(f"      末 human: {_oneline(dg['last_human'], 100)}")
+            if dg.get("last_agent"):
+                print(f"      末 agent: {_oneline(dg['last_agent'], 100)}")
         print()
-    print(f"# 合计: {len(groups)} 个项目目录, {total_main} 主会话, {total_sub} 子agent")
+
+    tail = ""
+    if paged and total_main > limit:
+        more = (f";--page {page + 1} 看更早" if hi < total_main else ";已到最早")
+        tail = f"  (第 {lo}-{hi}/{total_main} 条,最新在前{more},--limit 0 看全部)"
+    print(f"# 合计: {len(groups)} 个项目目录, {total_main} 主会话, {total_sub} 子agent{tail}")
     return 0
 
 
@@ -252,8 +315,7 @@ def cmd_overview(sf: SessionFiles, ev: list[Event]) -> int:
     tools = Counter(e.tool_name for e in ev if e.kind == Kind.TOOL)
     errs = [e for e in ev if e.kind == Kind.RESULT and e.is_error]
     skills = [e for e in ev if e.kind == Kind.SKILL]
-    tin = sum(e.tokens_in for e in ev)
-    tout = sum(e.tokens_out for e in ev)
+    tok = sum((e.tokens for e in ev), Token())
     sub_kinds = Counter(s.agent_type for s in sf.subagents)
     # 人类中途插话:首条之后、会话结束前的人类消息数(纠偏信号)
     interjections = max(0, len(humans) - 1)
@@ -271,7 +333,7 @@ def cmd_overview(sf: SessionFiles, ev: list[Event]) -> int:
         print(f"agents  {len(sf.subagents)} sub: {sk}")
     if skills:
         print(f"skills  {', '.join(dict.fromkeys(s.text for s in skills))}")
-    print(f"tokens  ~{tin:,} in / {tout:,} out")
+    print(f"tokens  {tok.fmt()}")
     if humans:
         print(f"\nfirst human: {_oneline(humans[0].text, 110)}")
         if len(humans) > 1:
@@ -368,7 +430,7 @@ def _subagent_digest(ev: list[Event], key: str) -> dict:
     _, _, dur = _span(sub)
     last = next((e for e in reversed(sub) if e.kind == Kind.AGENT), None)
     return {"n": len(sub), "tools": tools, "errors": errs, "dur": dur,
-            "final": last.text if last else "", "tok_out": sum(e.tokens_out for e in sub)}
+            "final": last.text if last else "", "tok": sum((e.tokens for e in sub), Token())}
 
 
 # spawn 工具:Claude 侧 Agent/Task,Codex 侧 spawn_agent
@@ -392,7 +454,7 @@ def cmd_agents(sf: SessionFiles, ev: list[Event]) -> int:
         print(f"{pad}{bullet} {s.agent_type}  {at}  {_oneline(s.description, 64)}")
         th = "  ".join(f"{n}×{c}" for n, c in d["tools"].most_common(6))
         print(f"{pad}    {d['n']} 事件  {sum(d['tools'].values())} 工具调用  "
-              f"{d['dur']//60}m{d['dur']%60:02d}s  错误×{len(d['errors'])}  {d['tok_out']:,} tok_out")
+              f"{d['dur']//60}m{d['dur']%60:02d}s  错误×{len(d['errors'])}  tokens {d['tok'].fmt()}")
         if th:
             print(f"{pad}    工具: {th}")
         if d["final"]:
@@ -758,8 +820,7 @@ def cmd_skill_report(sf: SessionFiles, ev: list[Event], skill: str | None) -> in
         interj = [e for e in seg if e.kind == Kind.HUMAN and not e.sidechain
                   and e.seq != start and not _is_cmd(e)]
         _, _, dur = _span(seg)
-        tin = sum(e.tokens_in for e in seg)
-        tout = sum(e.tokens_out for e in seg)
+        tok = sum((e.tokens for e in seg), Token())
         # 重复读同一文件(摩擦信号)
         reads = Counter(
             json.dumps(e.tool_input.get("file_path") if isinstance(e.tool_input, dict) else None)
@@ -776,17 +837,17 @@ def cmd_skill_report(sf: SessionFiles, ev: list[Event], skill: str | None) -> in
         print(f"② 执行      {len(seg)} 事件  {sum(tools.values())} 工具调用  "
               f"{dur // 60}m{dur % 60:02d}s")
         print(f"   工具      {'  '.join(f'{n}×{c}' for n, c in tools.most_common(8))}")
-        sub_tok = 0
+        sub_tok = Token()
         if spawns:
             print(f"   子agent   {'  '.join(f'{k}×{c}' for k, c in subs.items())}"
                   f"   (各子 agent 独立日志,详见 agents)")
             for sp in spawns:
                 d = _subagent_digest(ev, sp.tool_use_id)
-                sub_tok += d["tok_out"]
+                sub_tok += d["tok"]
                 styp, desc = _spawn_role(sp, sub_by_id)
                 print(f"     └ {styp} «{_oneline(desc, 40)}»: "
                       f"{sum(d['tools'].values())} 工具  错误×{len(d['errors'])}  "
-                      f"{d['tok_out']:,} tok_out")
+                      f"tokens {d['tok'].fmt()}")
                 if d["final"]:
                     print(f"        ⇒ {_oneline(d['final'], 76)}")
         print(f"③ 摩擦      错误×{len(errs)}  人类纠偏×{len(interj)}  重复读×{len(rereads)}")
@@ -794,9 +855,9 @@ def cmd_skill_report(sf: SessionFiles, ev: list[Event], skill: str | None) -> in
             print(f"     ✗ {_oneline(e.text, 90)}")
         for e in interj[:3]:
             print(f"     ⟳ 人类: {_oneline(e.text, 80)}")
-        cost = f"~{tin:,} tok_in / {tout:,} tok_out"
-        if sub_tok:
-            cost += f"  (+子agent {sub_tok:,} tok_out)"
+        cost = tok.fmt()
+        if sub_tok.total:
+            cost += f"  (+子agent {sub_tok.fmt()})"
         print(f"④ 成本      {cost}")
         # 结束原因
         nxt = next((e for e in ev if e.seq == end), None)
@@ -892,7 +953,7 @@ def cmd_query(sf: SessionFiles, ev: list[Event], q: str) -> int:
     elif verb == "json":
         print(json.dumps([{"seq": e.seq, "kind": e.kind.value, "ts": e.ts,
                            "tool": e.tool_name, "is_error": e.is_error,
-                           "text": e.text[:500]} for e in sel],
+                           "tokens": e.tokens.as_dict(), "text": e.text[:500]} for e in sel],
                          ensure_ascii=False, indent=2))
     else:  # timeline
         for e in sel:
@@ -957,8 +1018,13 @@ def main() -> None:
     ap.add_argument("--codex", action="store_true",
                     help="读 Codex(~/.codex)会话而非 Claude Code 会话;"
                          "selector 主用工作目录(按会话 cwd 反查)")
-    ap.add_argument("--check", action="store_true", help="预检环境")
-    ap.add_argument("--validate", metavar="SEL", help="执行后校验某 session 解析完整性")
+    ap.add_argument("--page", type=int, default=1, metavar="N",
+                    help="sessions:翻页,默认第 1 页(最近的)")
+    ap.add_argument("--limit", "-n", type=int, default=20, metavar="N",
+                    help="sessions:每页条数,默认 20;<=0 展示全部(关分页)")
+    ap.add_argument("--check", action="store_true", help="预检环境(加 --codex 检 Codex)")
+    ap.add_argument("--validate", metavar="SEL",
+                    help="校验某 session 解析完整性(加 --codex 校验 Codex 会话)")
     ap.add_argument("args", nargs="*", help="locate <sel> | <sel> <verb> [...]")
     ns = ap.parse_args()
     global _QUIET, _VERBOSE, _COUNT_LINES
@@ -985,7 +1051,8 @@ def main() -> None:
 
     # 项目级会话枚举/计数分支(selector 是项目目录/关键字,非单个 session)
     if a[0] == "sessions":
-        sys.exit(cmd_sessions(a[1] if len(a) > 1 else "", ns.json, ns.codex))
+        sys.exit(cmd_sessions(a[1] if len(a) > 1 else "", ns.json, ns.codex,
+                              page=ns.page, limit=ns.limit))
 
     # 其余:第一个参数是 selector/path,其后是 verb 或 query
     selector = a[0]

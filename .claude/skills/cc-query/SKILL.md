@@ -39,9 +39,15 @@ ccq locate /path/to/abc123.jsonl  # direct file path
 ccq sessions C:/w/HomeTrans-CJ   # path selector: exact dir + its .claude/ subdir sessions
 ccq sessions HomeTrans           # keyword selector: substring match on project folder name
 ccq sessions HomeTrans --json    # machine-readable: per-project + grand totals
+ccq sessions HomeTrans --page 2  # older page (sessions 21–40, newest-first)
+ccq sessions HomeTrans --limit 0 # disable paging: every session (slower, parses all)
 ```
 
-Output groups by project folder, lists each session (short id, mtime, sub-agent count), and prints a `# 合计:` line with total projects / main sessions / sub-agents. A path selector is encoded the same lossy way Claude Code names project dirs (every non-alnum char → `-`), so `C:/w/HomeTrans-CJ` also catches the `…\.claude` working-dir variant as a child.
+Output groups by project folder, lists each session (short id, mtime, sub-agent count), and under each session a short **会话摘要** (first genuine human input / last genuine human input / last agent reply — the same genuine-human filtering `overview` uses, so `<command-*>` and `$skill` triggers are skipped; the last-human line is omitted when there was only one human turn). It ends with a `# 合计:` line with total projects / main sessions / sub-agents. In `--json`, each session carries a `summary` object (`first_human` / `last_human` / `last_agent`).
+
+**Pagination (default on):** because each summary requires reading the session's whole log, `sessions` defaults to the **20 most recent** sessions (`mtime` newest-first, across all matched project dirs) and only parses summaries for that page — on a 55-session project this is ~0.26s instead of parsing all 55. Use `--page N` to walk back to older sessions, `--limit N` to change the page size, or `--limit 0` to show everything (no pagination, parses all). The `# 合计:` count always reflects the full total, not just the shown page; `--json` adds a top-level `pagination` block (`page` / `limit` / `shown` / `start` / `end` / `total_main_sessions`) and a per-project `shown` count.
+
+A path selector is encoded the same lossy way Claude Code names project dirs (every non-alnum char → `-`), so `C:/w/HomeTrans-CJ` also catches the `…\.claude` working-dir variant as a child.
 
 ### Check the tool works
 
@@ -66,7 +72,7 @@ ccq --codex <uuid-prefix> errors            # drill into one Codex session
 ccq --codex <uuid> "name=shell_command is_error=1 | show"
 ```
 
-Mapping into ccq's model: human/agent/thinking text + token counts come from the clean `event_msg` stream; tool calls/results from `response_item` (`shell_command`, `apply_patch`, `web_search`, …). Tokens are reported as non-cached input + output (mirrors the Claude side's cache-read exclusion).
+Mapping into ccq's model: human/agent/thinking text + token counts come from the clean `event_msg` stream; tool calls/results from `response_item` (`shell_command`, `apply_patch`, `web_search`, …). Tokens use the shared five-field `Token` model (see below); on the Codex side `thinking` is populated from `reasoning_output_tokens` and there is no `cache_write`.
 
 ## The Zoom-out → Zoom-in Flow
 
@@ -78,7 +84,9 @@ Always start wide, then narrow. Don't skip to `grep` or `show` without first see
 ccq d74d overview
 ```
 
-Shows: time window, turn count, tool histogram, error count, sub-agent breakdown, approximate token cost, first/last human and agent messages, top errors.
+Shows: time window, turn count, tool histogram, error count, sub-agent breakdown, token cost (five-field `Token` model, below), first/last human and agent messages, top errors.
+
+**Token model:** every token figure ccq prints (overview, `agents`, `skill-report ④ 成本`, `json` verb) uses one `Token {input, output, cache_read, cache_write, thinking}` struct. Fields are mutually exclusive; a field that is `0` is omitted from the display (so a Claude session never shows `thinking`, which it doesn't report; a Codex session never shows `cache_write`). The old scalar `tokens_in`/`tokens_out` (= `input+cache_write` / `output+thinking`) survive as backward-compat properties on `Event`.
 
 ### Step 2 — What's interesting?
 
@@ -211,7 +219,7 @@ lower-bound on file activity, not an exhaustive filesystem audit.
 ① 触发 → when, preceding human intent
 ② 执行 → event/tool counts, sub-agent spawns with per-agent digest
 ③ 摩擦 → error count, human interruptions/corrections, re-reads
-④ 成本 → token in/out (includes sub-agent token cost)
+④ 成本 → five-field Token breakdown (includes sub-agent token cost)
 ⑤ 结果 → why it ended (next skill / new human instruction / session end)
 ```
 
@@ -233,7 +241,7 @@ Sub-agents (spawned via `Agent` or `Task` tools) have **separate log files** und
 When the CLI verbs don't fit, import the parsing engine directly:
 
 ```python
-from scripts.ccq_core import load_session, locate, parse_events, Event, Kind
+from scripts.ccq_core import load_session, locate, parse_events, Event, Kind, Token
 
 sf, events = load_session("d74d")         # main + all sub-agents
 # or
