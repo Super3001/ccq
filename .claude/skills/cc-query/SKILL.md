@@ -1,6 +1,6 @@
 ---
 name: cc-query
-description: Use ccq to diagnose other Claude Code sessions. Triggers when user asks "what happened in session X", "why did that build fail", "review that session's skill usage", "check on my other Claude tab", "what was the agent doing last night", or any request to inspect/pry/review/audit a past or parallel Claude Code session. Also triggers when the user refers to a previous session by partial ID, wants to understand why a build failed, how a skill performed, or what errors occurred. Use this skill even for indirect references like "how did that go earlier" or "was the hmos skill effective yesterday."
+description: Use ccq to diagnose other Claude Code sessions. Triggers when user asks "what happened in session X", "why did that build fail", "review that session's skill usage", "check on my other Claude tab", "what was the agent doing last night", or any request to inspect/pry/review/audit a past or parallel Claude Code session. Also triggers when the user refers to a previous session by partial ID, wants to understand why a build failed, how a skill performed, or what errors occurred. Use this skill even for indirect references like "how did that go earlier" or "was the hmos skill effective yesterday.". Also triggers when the user use or refers to `ccq` and `cc-query` literally.
 ---
 
 # cc-query — Diagnose Other Claude Code Sessions
