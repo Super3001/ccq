@@ -39,6 +39,16 @@ Copy-Item -Recurse .claude/skills/cc-query $HOME\.claude\skills\
 用法:装好后无需额外配置,在 Claude Code 中用自然语言问某个 session 的情况即可触发;
 skill 内部就是调用下面这些 `ccq` 子命令。
 
+也可以手动触发,例如在 claude code/codex/... 当中输入:
+
+```prompt
+/cc-query locate <sessionId>
+/cc-query 请分析 <sessionId> 的 ...
+
+# 如果分析的是codex session日志,建议添加"--codex"
+/cc-query --codex 请分析 <sessionId> 的 ...
+```
+
 ## 卸载 (Uninstall)
 
 ```bash
