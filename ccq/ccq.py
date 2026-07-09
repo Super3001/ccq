@@ -27,6 +27,15 @@ agent 做了什么、遇到什么错误,并评估「agent 使用某 skill 的效
     ccq --codex sessions C:/w/HomeTrans-CJ   # 该目录下全部 Codex 会话与计数
     ccq --codex C:/w/HomeTrans-CJ overview    # 该目录最近一个 Codex 会话概览
     ccq --codex <uuid前缀> errors
+
+--opencode: 读 opencode(~/.local/share/opencode/opencode.db)SQLite 库而非
+  Claude Code 会话。opencode 把全部会话/子agent/消息/分片存于单一 SQLite 库,
+  按 session.id 区分;selector 用「工作目录」(按 session.directory 反查)、
+  session-id 前缀(如 ses_0bb1e5)、或 latest。所有动词通用。
+    ccq --opencode --check                      # 库与顶层会话计数
+    ccq --opencode sessions C:/w/HomeTrans-CJ   # 该目录下全部 opencode 会话
+    ccq --opencode ses_0bb1e5 overview          # 单会话概览
+    ccq --opencode latest errors                # 最近一个会话的错误
 """
 from __future__ import annotations
 
@@ -47,7 +56,8 @@ _COUNT_LINES = False
 
 from ccq.ccq_core import (
     Event, Kind, SessionFiles, Token, list_sessions, load_session, locate,
-    parse_events, parse_codex_events, projects_root, _codex_skill_names,
+    parse_events, parse_codex_events, parse_opencode_events, projects_root,
+    opencode_db_path, iter_opencode_sessions, _codex_skill_names, _SLASH_RE,
 )
 
 
@@ -95,12 +105,19 @@ def _action_label(e: Event) -> str:
 
 def _is_cmd(e: Event) -> bool:
     """该人类消息是否为命令/skill 触发(非用于界定区间的「真实提问」)。
-    Claude 侧:harness 注入的 <command-*> 标签;Codex 侧:$<name> 前缀触发。
-    这类消息不应成为它自己 skill 段的右边界。"""
+    Claude 侧:harness 注入的 <command-*> 标签;Codex 侧:$<name> 前缀触发;
+    opencode 侧:用户消息末尾的 /slash 独立行触发。这类消息不应成为它自己
+    skill 段的右边界(否则段会被立刻截断成空)。"""
     t = e.text or ""
     if any(tag in t for tag in _META_TAGS):
         return True
-    return bool(_codex_skill_names(t))
+    if _codex_skill_names(t):
+        return True
+    # /slash 独立行:覆盖 opencode 的末尾 /command 触发,也兜住 Claude 侧用户
+    # 手敲(非 harness 注入)的 /slash——后者原先漏网,会使 skill 段被自身截断。
+    if _SLASH_RE.search(t):
+        return True
+    return False
 
 
 def _is_interrupt(e: Event) -> bool:
@@ -121,8 +138,13 @@ def _genuine_humans(ev: list[Event]) -> list[Event]:
 
 def _seg_end(ev: list[Event], start: int, trigs: list[Event],
              genuine: list[Event]) -> int:
-    """skill 段终点:start 之后最近的「下一个 skill 触发」或「下一个真实提问」。"""
-    cands = [t.seq for t in trigs if t.seq > start] + [h.seq for h in genuine if h.seq > start]
+    """skill 段终点:start 之后最近的「下一个 skill 触发」或「下一个真实提问」。
+    排除与触发同处一个 part/message 的 HUMAN(同 uuid)——它是触发的意图本身
+    (opencode 按 footer 切分后,genuine prompt 与 SKILL 同 uuid),不是新指令。"""
+    trig = next((t for t in trigs if t.seq == start), None)
+    trig_uid = trig.uuid if trig else None
+    cands = ([t.seq for t in trigs if t.seq > start]
+             + [h.seq for h in genuine if h.seq > start and h.uuid != trig_uid])
     return min(cands) if cands else ev[-1].seq + 1
 
 
@@ -153,9 +175,10 @@ def _branch(ev: list[Event]) -> str:
 # --------------------------------------------------------------------------- #
 # Layer L: locate
 # --------------------------------------------------------------------------- #
-def cmd_locate(selector: str, as_json: bool, codex: bool = False) -> int:
+def cmd_locate(selector: str, as_json: bool, codex: bool = False,
+               opencode: bool = False) -> int:
     try:
-        sf = locate(selector, codex=codex)
+        sf = locate(selector, codex=codex, opencode=opencode)
     except LookupError as e:
         print(f"ccq locate: {e}", file=sys.stderr)
         return 2
@@ -188,14 +211,20 @@ def _mtime_str(epoch: float) -> str:
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M")
 
 
-def _session_digest(sf: SessionFiles, codex: bool = False) -> dict[str, str]:
+def _session_digest(sf: SessionFiles, codex: bool = False,
+                    opencode: bool = False) -> dict[str, str]:
     """单个会话的速览摘要:首个真实人类输入 + 末个真实人类输入 + 末个 agent 回复。
     只解析主会话文件(不含子 agent),避免 sessions 列表逐条全量加载。
     人类侧沿用 overview 口径(_genuine_humans),排除命令展开/中断等 harness 噪声,
     这样摘要展示的是真实提问而非 <command-*> 或 $skill 触发文本。
     末个人类仅在与首个不同(轮次>1)时给出,与 overview 保持一致。"""
     try:
-        ev = parse_codex_events(sf.main) if codex else parse_events(sf.main)
+        if opencode:
+            ev = parse_opencode_events(sf.main)
+        elif codex:
+            ev = parse_codex_events(sf.main)
+        else:
+            ev = parse_events(sf.main)
     except (OSError, ValueError):
         return {}
     humans = _genuine_humans(ev)
@@ -211,14 +240,15 @@ def _session_digest(sf: SessionFiles, codex: bool = False) -> dict[str, str]:
 
 
 def cmd_sessions(selector: str, as_json: bool, codex: bool = False,
-                 page: int = 1, limit: int = 20) -> int:
+                 opencode: bool = False, page: int = 1, limit: int = 20) -> int:
     """枚举某项目目录(或关键字)下的全部主会话与子 agent,并给出计数。
     selector 含路径分隔符时按工作目录精确匹配(含 .claude 等子目录会话)。
     codex=True 时枚举 Codex 会话(按会话 cwd 匹配该目录)。
+    opencode=True 时枚举 opencode 会话(按 session.directory 匹配)。
     默认分页:按 mtime 全局降序只展示最近 limit(=20)条,且只对展示的会话
     解析速览摘要——摘要要读整份日志,不分页会让大项目每次都全量解析而变慢。
     page 翻到更早的一页;limit<=0 关闭分页,展示全部。"""
-    sessions = list_sessions(selector, codex=codex)
+    sessions = list_sessions(selector, codex=codex, opencode=opencode)
     if not sessions:
         print(f"ccq sessions: 无匹配项目 {selector!r}", file=sys.stderr)
         return 2
@@ -258,7 +288,7 @@ def cmd_sessions(selector: str, as_json: bool, codex: bool = False,
                      "mtime": _mtime_str(s.mtime),
                      "subagents": len(s.subagents),
                      "main": str(s.main),
-                     "summary": _session_digest(s, codex)}
+                      "summary": _session_digest(s, codex, opencode)}
                     for s in win
                 ],
             })
@@ -288,7 +318,7 @@ def cmd_sessions(selector: str, as_json: bool, codex: bool = False,
         for s in win:
             mark = f"subs {len(s.subagents)}" if s.subagents else "      "
             print(f"  {s.session_id[:8]}  {_mtime_str(s.mtime)}   {mark}")
-            dg = _session_digest(s, codex)
+            dg = _session_digest(s, codex, opencode)
             if dg.get("first_human"):
                 print(f"      首 human: {_oneline(dg['first_human'], 100)}")
             if dg.get("last_human"):
@@ -816,9 +846,10 @@ def cmd_skill_report(sf: SessionFiles, ev: list[Event], skill: str | None) -> in
         sub_by_id = {s.tool_use_id: s for s in sf.subagents}
         spawns = [e for e in seg if e.kind == Kind.TOOL and e.tool_name in _SPAWN_TOOLS]
         subs = Counter(_spawn_role(e, sub_by_id)[0] for e in spawns)
-        # 段内人类插话(中断/纠偏):排除触发自身的命令展开
+        # 段内人类插话(中断/纠偏):排除触发自身的命令展开,以及与触发同 part 的
+        # HUMAN(opencode footer 切分后 genuine prompt 与 SKILL 同 uuid,是意图非纠偏)
         interj = [e for e in seg if e.kind == Kind.HUMAN and not e.sidechain
-                  and e.seq != start and not _is_cmd(e)]
+                  and e.seq != start and not _is_cmd(e) and e.uuid != trig.uuid]
         _, _, dur = _span(seg)
         tok = sum((e.tokens for e in seg), Token())
         # 重复读同一文件(摩擦信号)
@@ -964,7 +995,21 @@ def cmd_query(sf: SessionFiles, ev: list[Event], q: str) -> int:
 # --------------------------------------------------------------------------- #
 # --check / --validate
 # --------------------------------------------------------------------------- #
-def do_check(codex: bool = False) -> int:
+def do_check(codex: bool = False, opencode: bool = False) -> int:
+    if opencode:
+        db = opencode_db_path()
+        ok = db.exists()
+        print(f"[check] opencode db: {db}  {'OK' if ok else '缺失'}")
+        if not ok:
+            return 1
+        try:
+            n = sum(1 for _ in iter_opencode_sessions())
+        except Exception as e:
+            print(f"[check] 读取失败: {e}", file=sys.stderr)
+            return 1
+        print(f"[check] 发现 {n} 个 opencode 顶层会话")
+        print(f"[check] python {sys.version.split()[0]}  (无需 jq)")
+        return 0 if n else 1
     if codex:
         from ccq.ccq_core import codex_sessions_root, iter_codex_logs
         root = codex_sessions_root()
@@ -987,9 +1032,10 @@ def do_check(codex: bool = False) -> int:
     return 0 if n else 1
 
 
-def do_validate(selector: str, codex: bool = False) -> int:
+def do_validate(selector: str, codex: bool = False,
+                opencode: bool = False) -> int:
     try:
-        sf, ev = load_session(selector, codex=codex)
+        sf, ev = load_session(selector, codex=codex, opencode=opencode)
     except Exception as e:
         print(f"[validate] 加载失败: {e}", file=sys.stderr)
         return 1
@@ -998,8 +1044,14 @@ def do_validate(selector: str, codex: bool = False) -> int:
     orphan = [e for e in tr if e.tool_use_id not in tu]
     print(f"[validate] session {sf.session_id}  事件 {len(ev)}  "
           f"工具 {len(tu)}  结果 {len(tr)}  孤儿结果 {len(orphan)}")
-    print(f"[validate] 子 agent {len(sf.subagents)} 个均可解析"
-          if all(s.path.exists() for s in sf.subagents) else "[validate] 子 agent 文件缺失")
+    # opencode 子 agent 是 DB 行而非文件,s.path=Path(<session_id>)不指向真实文件;
+    # 已从库查得故存在性隐含,只报数。
+    if opencode:
+        print(f"[validate] 子 agent {len(sf.subagents)} 个(库内 session 行)")
+    else:
+        print(f"[validate] 子 agent {len(sf.subagents)} 个均可解析"
+              if all(s.path.exists() for s in sf.subagents)
+              else "[validate] 子 agent 文件缺失")
     return 0 if len(orphan) == 0 else 1
 
 
@@ -1018,13 +1070,17 @@ def main() -> None:
     ap.add_argument("--codex", action="store_true",
                     help="读 Codex(~/.codex)会话而非 Claude Code 会话;"
                          "selector 主用工作目录(按会话 cwd 反查)")
+    ap.add_argument("--opencode", action="store_true",
+                    help="读 opencode(~/.local/share/opencode/opencode.db)SQLite 库"
+                         "而非 Claude Code 会话;selector 用工作目录 / session-id 前缀 / latest")
     ap.add_argument("--page", type=int, default=1, metavar="N",
                     help="sessions:翻页,默认第 1 页(最近的)")
     ap.add_argument("--limit", "-n", type=int, default=20, metavar="N",
                     help="sessions:每页条数,默认 20;<=0 展示全部(关分页)")
-    ap.add_argument("--check", action="store_true", help="预检环境(加 --codex 检 Codex)")
+    ap.add_argument("--check", action="store_true",
+                    help="预检环境(加 --codex 检 Codex;加 --opencode 检 opencode 库)")
     ap.add_argument("--validate", metavar="SEL",
-                    help="校验某 session 解析完整性(加 --codex 校验 Codex 会话)")
+                    help="校验某 session 解析完整性(加 --codex/--opencode 校验对应会话)")
     ap.add_argument("args", nargs="*", help="locate <sel> | <sel> <verb> [...]")
     ns = ap.parse_args()
     global _QUIET, _VERBOSE, _COUNT_LINES
@@ -1033,9 +1089,9 @@ def main() -> None:
     _COUNT_LINES = ns.lines
 
     if ns.check:
-        sys.exit(do_check(ns.codex))
+        sys.exit(do_check(ns.codex, ns.opencode))
     if ns.validate:
-        sys.exit(do_validate(ns.validate, ns.codex))
+        sys.exit(do_validate(ns.validate, ns.codex, ns.opencode))
 
     a = ns.args
     if not a:
@@ -1047,18 +1103,18 @@ def main() -> None:
         if len(a) < 2:
             print("用法: ccq locate <selector>", file=sys.stderr)
             sys.exit(2)
-        sys.exit(cmd_locate(a[1], ns.json, ns.codex))
+        sys.exit(cmd_locate(a[1], ns.json, ns.codex, ns.opencode))
 
     # 项目级会话枚举/计数分支(selector 是项目目录/关键字,非单个 session)
     if a[0] == "sessions":
         sys.exit(cmd_sessions(a[1] if len(a) > 1 else "", ns.json, ns.codex,
-                              page=ns.page, limit=ns.limit))
+                              opencode=ns.opencode, page=ns.page, limit=ns.limit))
 
     # 其余:第一个参数是 selector/path,其后是 verb 或 query
     selector = a[0]
     rest = a[1:]
     try:
-        sf, ev = load_session(selector, codex=ns.codex)
+        sf, ev = load_session(selector, codex=ns.codex, opencode=ns.opencode)
     except Exception as e:
         print(f"ccq: {e}", file=sys.stderr)
         sys.exit(2)

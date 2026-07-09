@@ -1,6 +1,6 @@
 ---
 name: cc-query
-description: Use ccq to diagnose other Claude Code sessions. Triggers when user asks "what happened in session X", "why did that build fail", "review that session's skill usage", "check on my other Claude tab", "what was the agent doing last night", or any request to inspect/pry/review/audit a past or parallel Claude Code session. Also triggers when the user refers to a previous session by partial ID, wants to understand why a build failed, how a skill performed, or what errors occurred. Use this skill even for indirect references like "how did that go earlier" or "was the hmos skill effective yesterday."
+description: Use ccq to diagnose other Claude Code, OpenAI Codex, or opencode sessions. Triggers when user asks "what happened in session X", "why did that build fail", "review that session's skill usage", "check on my other Claude tab", "what was the agent doing last night", or any request to inspect/pry/review/audit a past or parallel Claude Code / Codex / opencode session. Also triggers when the user refers to a previous session by partial ID, wants to understand why a build failed, how a skill performed, or what errors occurred. Use this skill even for indirect references like "how did that go earlier", "was the hmos skill effective yesterday", "看看那个 opencode 会话", "opencode 跑得怎么样", or any opencode log/session diagnosis need.
 ---
 
 # cc-query — Diagnose Other Claude Code Sessions
@@ -52,8 +52,11 @@ A path selector is encoded the same lossy way Claude Code names project dirs (ev
 ### Check the tool works
 
 ```bash
-ccq --check       # verify projects root and session count
-ccq --validate d74d   # verify a specific session parses cleanly
+ccq --check               # verify projects root and session count
+ccq --codex --check       # verify Codex sessions root + count
+ccq --opencode --check    # verify opencode db + top-level session count
+ccq --validate d74d            # verify a specific Claude session parses cleanly
+ccq --opencode --validate ses_0bb1e5   # verify an opencode session parses cleanly
 ```
 
 ### Diagnosing Codex sessions (`--codex`)
@@ -74,6 +77,35 @@ ccq --codex <uuid> "name=shell_command is_error=1 | show"
 
 Mapping into ccq's model: human/agent/thinking text + token counts come from the clean `event_msg` stream; tool calls/results from `response_item` (`shell_command`, `apply_patch`, `web_search`, …). Tokens use the shared five-field `Token` model (see below); on the Codex side `thinking` is populated from `reasoning_output_tokens` and there is no `cache_write`.
 
+### Diagnosing opencode sessions (`--opencode`)
+
+Pass `--opencode` to read **opencode** (sst/opencode CLI) sessions from `~/.local/share/opencode/opencode.db` — a single SQLite database, not JSONL. Every verb works the same; only the source and selector semantics change:
+
+- opencode stores **all** sessions, sub-agents, messages, and message-parts in one SQLite DB, keyed by `session.id` (shaped `ses_<…>`). `ccq` opens it read-only (WAL-safe — reads don't block the live opencode writing).
+- **Selector** is one of: a working directory (matched against each session's `directory`), a `session.id` prefix (e.g. `ses_0bb1e5`), or `latest[:<dir-or-keyword>]`. Sub-agent sessions (`session.parent_id` set) are excluded from the top-level `sessions`/`locate` listing — reach them via the parent's `agents` verb.
+- **Sub-agents** are independent session rows linked to the parent via `session.parent_id`. The parent's `task` tool call carries the child `session.id` in `state.metadata.sessionId`; ccq reconstructs the call tree (each sub-agent labeled with its `subagent_type` + the parent `task` callID).
+- **Skill triggers**: opencode **auto-injects** a skill's full `SKILL.md` into the user message text-part when the user's request matches the skill's trigger description — the user does **not** type a `/slash` or paste the content. (The agent can also invoke the `skill` tool directly, `input.name`.) The injected content ends with a two-line footer:
+  ```
+  Base directory for this skill: <abs path to skill dir>
+  Relative paths in this skill (e.g., scripts/, references/) are relative to this base directory.
+  ```
+  ccq uses this footer as the primary split marker: everything after it is the user's genuine prompt; the skill name is taken from the footer path's last segment (`…\skills\req-optimize` → `req-optimize`). If the user's prompt after the footer starts with a `/command` (explicit `/slash` invocation), that command name wins as the trigger. Skills without the footer fall back to a `/command`-line heuristic. This keeps session digests and `skill-report ① 意图` showing the genuine request (e.g. `specgen 查询当前状态`, not `# req-optimize …`) while still emitting the `SKILL` event.
+- **Tool names** are lowercase in opencode (`read`/`write`/`edit`/`bash`/`task`/`skill`/`apply_patch`/…); ccq normalizes them to Claude's conventions (`Read`/`Write`/`Edit`/`Bash`/`Task`/`Skill`) so the `files` (R/A/M), `agents` (sub-agent tree), and `skills` classification logic works unchanged. `apply_patch` input (`patchText`) and camelCase file fields (`filePath`/`oldString`/`newString`) are normalized too.
+- **Tokens** use the shared five-field `Token` model; opencode's per-message `tokens.{input,output,reasoning,cache.read,cache.write}` maps directly (`reasoning` → `thinking`). `cache_write` is reported by opencode (unlike Codex).
+
+```bash
+ccq --opencode --check                          # db + top-level session count
+ccq --opencode sessions C:/w/HomeTrans-CJ       # all opencode sessions run in that dir + count
+ccq --opencode ses_0bb1e5 overview              # one session by id-prefix
+ccq --opencode latest errors                    # most recent session's errors
+ccq --opencode ses_0bb784 agents                # sub-agent tree (child session ids)
+ccq --opencode -L ses_0bb864 files              # R/A/M + line churn per file
+ccq --opencode ses_0bb1e5 skill-report cc-query # was the cc-query skill effective?
+ccq --opencode ses_0bb1e5 "kind=tool name=Bash is_error=1 | show"
+```
+
+Mapping into ccq's model: human/agent text comes from `part` (`type=text`) under `message` (`role` user/assistant); thinking from `part` (`type=reasoning`); each `part` (`type=tool`) is split into a TOOL event (call, `state.input`) and a RESULT event (`state.output`/`state.error`, `is_error = state.status=="error"`), linked by `callID` — mirroring Claude's `tool_use`/`tool_result` dual-event shape so `errors`/`files`/DSL reuse the same logic. Tokens are attributed message-level (to the first event of each assistant message). Auto-injected skill content is split off from the user's genuine prompt via the footer marker (above); the co-located HUMAN (same part `uuid` as the SKILL trigger) is treated as the trigger's intent, not a segment boundary or interjection.
+
 ## The Zoom-out → Zoom-in Flow
 
 Always start wide, then narrow. Don't skip to `grep` or `show` without first seeing the overview — you'll waste turns.
@@ -86,7 +118,7 @@ ccq d74d overview
 
 Shows: time window, turn count, tool histogram, error count, sub-agent breakdown, token cost (five-field `Token` model, below), first/last human and agent messages, top errors.
 
-**Token model:** every token figure ccq prints (overview, `agents`, `skill-report ④ 成本`, `json` verb) uses one `Token {input, output, cache_read, cache_write, thinking}` struct. Fields are mutually exclusive; a field that is `0` is omitted from the display (so a Claude session never shows `thinking`, which it doesn't report; a Codex session never shows `cache_write`). The old scalar `tokens_in`/`tokens_out` (= `input+cache_write` / `output+thinking`) survive as backward-compat properties on `Event`.
+**Token model:** every token figure ccq prints (overview, `agents`, `skill-report ④ 成本`, `json` verb) uses one `Token {input, output, cache_read, cache_write, thinking}` struct. Fields are mutually exclusive; a field that is `0` is omitted from the display (so a Claude session never shows `thinking`, which it doesn't report; a Codex session never shows `cache_write`; an opencode session can show all five, since it reports both `reasoning`→`thinking` and `cache.write`). The old scalar `tokens_in`/`tokens_out` (= `input+cache_write` / `output+thinking`) survive as backward-compat properties on `Event`.
 
 ### Step 2 — What's interesting?
 
@@ -227,6 +259,26 @@ Skill triggers are detected from **both** human-typed `/slash` commands AND agen
 
 **Evaluating a skill:** look for friction signals — high error count, human interruptions mid-segment, agents re-reading the same files repeatedly — these indicate the skill is struggling. A clean skill segment has zero errors, zero interjections, and clear sub-agent delegation.
 
+### skill-report is segment-scoped — cross-check `files`/`agents` for actual output
+
+`skill-report` is bounded by the skill **trigger**: it starts at the `/slash` or auto-injected SKILL event and ends at the next genuine human instruction (⑤ 结果 = "人类下达新指令" / "next skill"). This isolates one skill invocation for assessment — but it has a sharp edge: **work done in the continuation, after the user's follow-up instruction, is NOT in the skill-report**, even when that work is logically part of the same campaign.
+
+The trap bites hardest on "closed-loop" skills (req-optimize specgen, hmos-spec-generate, spec-audit-plus-repair) that run in two phases:
+1. A short trigger phase *inside* the segment — often just a status query or a plan (skill-report shows ~1m, few tools, 0 sub-agents).
+2. A production phase *after* the user says "开始" / "继续" / "go" — the agent then spawns spec-gen / audit / repair sub-agents that write the real output files. These sub-agents are NOT attributed to the skill segment, because they were spawned by the follow-up instruction, not the trigger.
+
+Judging "did this skill produce output?" from skill-report alone yields a **false negative**: you see a 1-minute status query and conclude "nothing was produced", when the session actually went on to write dozens of SPEC files via sub-agents in the continuation. (This exact misread happened twice in one session before being caught by `files`.)
+
+The fix: to answer "did this skill/session actually produce files?", run `files` — it scans the **whole session + every sub-agent** for `Write`/create evidence and is not segment-bounded, so it catches output written in the continuation that skill-report misses. `agents` likewise lists sub-agents spawned across the entire session. If `files` shows created output but skill-report shows a tiny segment, that's the tell: production happened post-trigger, driven by a follow-up human instruction.
+
+```bash
+ccq <sel> skill-report <skill>   # segment-scoped: trigger phase only
+ccq <sel> files                  # session-scoped: ALL writes incl. continuation + sub-agents
+ccq <sel> agents                 # sub-agents spawned across the WHOLE session, not just the segment
+```
+
+A corollary: when skill-report's ⑤ 结果 reads "人类下达新指令", do not assume the campaign ended — it means the *skill segment* ended. Read `agents` / `files` to see what the follow-up instruction actually drove.
+
 ## Sub-Agents and Their Logs
 
 Sub-agents (spawned via `Agent` or `Task` tools) have **separate log files** under `<sid>/subagents/agent-<hash>.jsonl`, with `<hash>.meta.json` recording `{agentType, description, toolUseId}`.
@@ -275,6 +327,10 @@ ccq <sel> "is_error=1 name=Bash | show"  # full error details
 ccq <sel> skill-report <skill-name>
 # Read ③ 摩擦: errors, human corrections, re-reads
 # Read ⑤ 结果: did it complete or get interrupted?
+# ⚠ If ⑤ = "人类下达新指令", the skill SEGMENT ended but the session may have
+#   kept producing via sub-agents — skill-report won't show that work.
+ccq <sel> files     # cross-check: actual files written (session-wide, not segment-scoped)
+ccq <sel> agents    # sub-agents spawned across the whole session
 ```
 
 ### "What did that agent actually do?"

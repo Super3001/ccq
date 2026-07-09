@@ -382,10 +382,14 @@ def iter_projects(selector: str = "") -> list[Path]:
     return sorted(hits, key=lambda p: p.name)
 
 
-def list_sessions(selector: str = "", codex: bool = False) -> list[SessionFiles]:
+def list_sessions(selector: str = "", codex: bool = False,
+                  opencode: bool = False) -> list[SessionFiles]:
     """列出匹配项目目录下的全部主会话(各自带子 agent 列表)。
     只读目录与 meta(不解析事件),对大量会话也轻量。按 mtime 降序。
-    codex=True 时改读 ~/.codex 下的 Codex 会话(见 list_codex_sessions)。"""
+    codex=True 时改读 ~/.codex 下的 Codex 会话(见 list_codex_sessions)。
+    opencode=True 时改读 opencode SQLite 库(见 list_opencode_sessions)。"""
+    if opencode:
+        return list_opencode_sessions(selector)
     if codex:
         return list_codex_sessions(selector)
     out: list[SessionFiles] = []
@@ -396,14 +400,18 @@ def list_sessions(selector: str = "", codex: bool = False) -> list[SessionFiles]
     return out
 
 
-def locate(selector: str, codex: bool = False) -> SessionFiles:
+def locate(selector: str, codex: bool = False,
+           opencode: bool = False) -> SessionFiles:
     """把 selector 解析为一个 session。支持:
     - 直接文件路径(.jsonl)
     - 'latest' / 'latest:<proj关键字>'
     - partial session-id 前缀(如 'd74d')
     抛 LookupError 表示找不到或歧义。
     codex=True 时改走 Codex 定位(见 locate_codex)。
+    opencode=True 时改走 opencode 定位(见 locate_opencode)。
     """
+    if opencode:
+        return locate_opencode(selector)
     if codex:
         return locate_codex(selector)
     # 1) 直接路径
@@ -438,11 +446,30 @@ def locate(selector: str, codex: bool = False) -> SessionFiles:
 
 
 def load_session(selector: str, include_subagents: bool = True,
-                 codex: bool = False) -> tuple[SessionFiles, list[Event]]:
+                 codex: bool = False, opencode: bool = False
+                 ) -> tuple[SessionFiles, list[Event]]:
     """定位并加载一个 session 的全部事件(主 + 可选子 agent)。
     子 agent 事件接在主事件之后,seq 在各自文件内独立,但加全局偏移避免冲突。
     codex=True 时改读 Codex 会话:子 agent 是同档独立 rollout,经 spawn_agent
-    链接重建调用树,子事件标 agent_type/agent_id(=spawn call_id)/sidechain。"""
+    链接重建调用树,子事件标 agent_type/agent_id(=spawn call_id)/sidechain。
+    opencode=True 时改读 opencode SQLite 库:子 agent 是独立 session 行
+    (parent_id 指向父),经父会话 task 工具的 state.metadata.sessionId 反查 callID,
+    子事件标 agent_type/agent_id(=task callID)/sidechain。"""
+    if opencode:
+        sf = locate_opencode(selector)
+        events = parse_opencode_events(sf.main)
+        if include_subagents:
+            offset = events[-1].seq if events else 0
+            for sub in sf.subagents:
+                sub_ev = parse_opencode_events(sub.path,
+                                               agent_type=sub.agent_type,
+                                               agent_id=sub.tool_use_id)
+                for e in sub_ev:
+                    e.seq += offset
+                    e.sidechain = True
+                events.extend(sub_ev)
+                offset += (sub_ev[-1].seq - offset) if sub_ev else 0
+        return sf, events
     if codex:
         sf = locate_codex(selector)
         events = parse_codex_events(sf.main)
@@ -810,4 +837,449 @@ def parse_codex_events(path: str | Path) -> list[Event]:
                 events.append(Event(seq, Kind.SUMMARY,
                                     text=str(p.get("message") or p)[:2000], **common))
             # session_meta / turn_context 不产事件
+    return events
+
+
+# --------------------------------------------------------------------------- #
+# opencode (sst/opencode CLI) 日志适配 — SQLite 后端
+# --------------------------------------------------------------------------- #
+# opencode 与 Claude Code / Codex 的日志差异:
+#   - 存储:单一 SQLite 库 ~/.local/share/opencode/opencode.db(非 JSONL)。
+#     所有会话、子 agent、消息、消息分片(part)共库;按 session.id 区分。
+#   - session 行:已聚合 tokens(input/output/reasoning/cache_read/cache_write)、
+#     cost、model、directory(cwd)、title、parent_id(子 agent 指向父 session)、
+#     agent(opencode 的 mode:build/plan/general;子 agent 取 subagent_type)。
+#   - message 行:role ∈ user/assistant,带 tokens/cost/time;data JSON。
+#   - part 行:消息分片,type ∈ text/tool/reasoning/step-start/step-finish/
+#     patch/compaction/file。tool 分片把「调用 + 结果」合在同一 part:
+#     state.{status,input,output,error,metadata};status ∈ completed/error/running。
+#   - 子 agent:独立的 session 行(parent_id 指向父)。父会话用 task 工具调用
+#     派生,task 分片的 state.metadata.sessionId 即子 session id(实测全命中)。
+#   - skill 触发:opencode 按「用户请求匹配 skill 触发描述」自动把整段 SKILL.md
+#     注入到用户 text part 开头(非用户手敲 /slash,也非用户粘贴)。注入内容以
+#     "Base directory for this skill: <path>\nRelative paths in this skill ...
+#     base directory." footer 收尾,其后才是用户真实输入;按此 footer 切分并抽
+#     skill 名(路径末段)。另:agent 也可用 tool=skill 分片(input.name)主动加载。
+#   - 工具名小写(read/write/edit/bash/task/skill/apply_patch/...),归一到
+#     Claude 大写约定(Read/Write/Edit/Bash/Task/Skill)以复用 ccq 的 files/
+#     agents/skills 分类逻辑;apply_patch 已是小写,与 Codex 同形,直接复用。
+#   - apply_patch 输入字段是 patchText(字符串),归一为 tool_input=字符串本身,
+#     使 ccq 的 _parse_apply_patch 走 isinstance(str) 分支(与 Codex 一致)。
+#   - 文件路径字段 camelCase(filePath/oldString/newString),归一为 snake_case
+#     (file_path/old_string/new_string),使 _file_path_of / _seq_churn 复用。
+import sqlite3
+
+_OPENCODE_TOOL_MAP = {
+    "read": "Read", "write": "Write", "edit": "Edit",
+    "bash": "Bash", "skill": "Skill", "task": "Task",
+}
+_OPENCODE_FIELD_MAP = {
+    "filePath": "file_path", "oldString": "old_string", "newString": "new_string",
+}
+# opencode 按「用户请求匹配 skill 触发描述」自动把整段 SKILL.md 注入到用户 text part
+# 开头(非用户手敲 /slash,也非用户粘贴)。注入内容以两行 footer 收尾:
+#   Base directory for this skill: <abs path to skill dir>
+#   Relative paths in this skill (e.g., scripts/, references/) are relative to this base directory.
+# 其后才是用户真实输入。用此 footer 作主切分标记(抽 skill 名 = 路径末段);
+# skill 无此 footer 时退回 /command 行启发。
+_OPENCODE_SKILL_FOOTER = re.compile(
+    r"Base directory for this skill:\s*([^\n]+?)\s*\n"
+    r"Relative paths in this skill.*?base directory\.\s*\n+",
+    re.I,
+)
+
+
+def opencode_db_path() -> Path:
+    """~/.local/share/opencode/opencode.db 的绝对路径。"""
+    return Path(os.path.expanduser("~")) / ".local" / "share" / "opencode" / "opencode.db"
+
+
+def _opencode_conn(db: Path | None = None):
+    """只读连接 opencode 库(WAL 模式下读不阻塞写)。库缺失抛 FileNotFoundError。"""
+    p = db or opencode_db_path()
+    if not p.exists():
+        raise FileNotFoundError(f"opencode 库不存在: {p}")
+    # mode=ro 只读;immutable 不可(WAL 活跃时会读到旧快照)。timeout 容让写锁。
+    return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True, timeout=30)
+
+
+def _opencode_row(conn, session_id: str) -> dict | None:
+    """单 session 行(列名→值)。"""
+    cur = conn.execute(
+        "SELECT id, project_id, parent_id, slug, directory, title, agent, model, "
+        "cost, tokens_input, tokens_output, tokens_reasoning, "
+        "tokens_cache_read, tokens_cache_write, time_created, time_updated "
+        "FROM session WHERE id = ?", (session_id,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    cols = [d[0] for d in cur.description]
+    return dict(zip(cols, r))
+
+
+def _opencode_session_files(session_id: str, row: dict | None = None,
+                            conn=None) -> SessionFiles:
+    """由 session_id 构造 SessionFiles(main=Path(session_id),project=directory)。
+    子 agent 经 _opencode_subagents_for 填充。"""
+    own_conn = conn is None
+    if own_conn:
+        conn = _opencode_conn()
+    try:
+        if row is None:
+            row = _opencode_row(conn, session_id) or {}
+        mtime = (row.get("time_updated") or row.get("time_created") or 0) / 1000
+        sf = SessionFiles(
+            session_id=row.get("id") or session_id,
+            project=row.get("directory") or "?",
+            main=Path(session_id),
+            subagents=[],
+            mtime=mtime,
+        )
+        sf.subagents = _opencode_subagents_for(session_id, conn)
+        return sf
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _opencode_task_calls(conn, session_id: str) -> dict[str, tuple[str, str, str]]:
+    """父会话的 task 工具调用 → {child_session_id: (callID, subagent_type, description)}。
+    task 分片的 state.metadata.sessionId 即子 session id。"""
+    out: dict[str, tuple[str, str, str]] = {}
+    cur = conn.execute(
+        "SELECT data FROM part WHERE session_id = ? AND "
+        "json_extract(data, '$.type') = 'tool' AND "
+        "json_extract(data, '$.tool') = 'task'", (session_id,))
+    for (d,) in cur.fetchall():
+        try:
+            o = json.loads(d)
+        except Exception:
+            continue
+        st = (o.get("state") or {})
+        inp = st.get("input") or {}
+        cid = o.get("callID") or ""
+        sid = (st.get("metadata") or {}).get("sessionId") or ""
+        if not sid:
+            continue
+        out[sid] = (cid, inp.get("subagent_type") or "", inp.get("description") or "")
+    return out
+
+
+def _opencode_subagents_for(session_id: str, conn=None) -> list[SubAgent]:
+    """该会话派生的全部子 agent(session.parent_id 指向本会话)。
+    tool_use_id 取父会话 task 调用的 callID(经 metadata.sessionId 反查);
+    agent_type 取 task input.subagent_type,回退到子 session 的 agent 列;
+    description 取子 session 的 title。"""
+    own_conn = conn is None
+    if own_conn:
+        conn = _opencode_conn()
+    try:
+        task_map = _opencode_task_calls(conn, session_id)
+        cur = conn.execute(
+            "SELECT id, agent, title, time_created FROM session "
+            "WHERE parent_id = ? ORDER BY time_created", (session_id,))
+        out: list[SubAgent] = []
+        for sid, agent, title, _tc in cur.fetchall():
+            cid, styp, sdesc = task_map.get(sid, ("", "", ""))
+            out.append(SubAgent(
+                agent_type=styp or agent or "general",
+                description=title or sdesc or "",
+                tool_use_id=cid or sid,
+                path=Path(sid),
+                depth=0,
+            ))
+        return out
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def iter_opencode_sessions() -> Iterator[tuple[str, dict]]:
+    """全部顶层 opencode 会话(子 agent 不进列表,经父会话 agents 钻取)。
+    yield (session_id, row{directory,title,agent,time_created,time_updated})。"""
+    conn = _opencode_conn()
+    try:
+        cur = conn.execute(
+            "SELECT id, directory, title, agent, time_created, time_updated "
+            "FROM session WHERE parent_id IS NULL OR parent_id = '' "
+            "ORDER BY time_updated DESC")
+        for sid, directory, title, agent, tc, tu in cur.fetchall():
+            yield sid, {"directory": directory, "title": title, "agent": agent,
+                        "time_created": tc, "time_updated": tu}
+    finally:
+        conn.close()
+
+
+def _opencode_list_top_rows(conn, selector: str) -> list[tuple[str, dict]]:
+    """匹配 selector 的顶层会话行(已过滤子 agent)。selector 语义同
+    list_opencode_sessions:路径→directory 精确/前缀;关键字→directory/title 子串。"""
+    is_path = bool(selector) and bool(re.search(r"[\\/:]", selector))
+    nsel = _norm_dir(selector) if is_path else ""
+    kw = selector.lower() if selector else ""
+    cur = conn.execute(
+        "SELECT id, directory, title, agent, time_created, time_updated "
+        "FROM session WHERE parent_id IS NULL OR parent_id = '' "
+        "ORDER BY time_updated DESC")
+    out: list[tuple[str, dict]] = []
+    for sid, directory, title, agent, tc, tu in cur.fetchall():
+        row = {"directory": directory or "", "title": title or "",
+               "agent": agent, "time_created": tc, "time_updated": tu}
+        if selector:
+            if is_path:
+                nd = _norm_dir(row["directory"])
+                if not (nd == nsel or nd.startswith(nsel + os.sep)):
+                    continue
+            elif (kw not in row["directory"].lower()
+                  and kw not in row["title"].lower()):
+                continue
+        out.append((sid, row))
+    return out
+
+
+def list_opencode_sessions(selector: str = "") -> list[SessionFiles]:
+    """列出匹配 selector 的顶层 opencode 会话(按 mtime 降序)。
+    - selector 含路径分隔符 → 视为工作目录:精确 directory 匹配 + 子目录前缀
+      (把目录下子工程的会话一并纳入,与 Claude/Codex 侧行为对齐)。
+    - 否则视为关键字,对 directory 或 title 做大小写无关子串匹配。
+    - 空 → 全部。"""
+    conn = _opencode_conn()
+    try:
+        out: list[SessionFiles] = []
+        for sid, row in _opencode_list_top_rows(conn, selector):
+            out.append(_opencode_session_files(sid, row, conn))
+        out.sort(key=lambda s: s.mtime, reverse=True)
+        return out
+    finally:
+        conn.close()
+
+
+def locate_opencode(selector: str) -> SessionFiles:
+    """把 selector 解析为一个 opencode 顶层会话(目录有多个时取最近)。支持:
+    - 'latest' / 'latest:<目录或关键字>'
+    - 工作目录(含路径分隔符)→ directory 精确/前缀匹配
+    - session-id 完整或前缀(如 ses_0bb1e5)
+    抛 LookupError 表示找不到或歧义。"""
+    conn = _opencode_conn()
+    try:
+        # 1) latest [: 目录/关键字]
+        if selector == "latest" or selector.startswith("latest:"):
+            kw = selector.split(":", 1)[1] if ":" in selector else ""
+            sub = list_opencode_sessions(kw)
+            if not sub:
+                raise LookupError(f"opencode latest: 无匹配 (kw={kw!r})")
+            return sub[0]
+
+        # 2) 工作目录匹配
+        if re.search(r"[\\/:]", selector):
+            hits = list_opencode_sessions(selector)
+            if not hits:
+                raise LookupError(f"无 opencode 会话 directory 匹配 {selector!r}")
+            return hits[0]
+
+        # 3) session-id 前缀(允许直接定位子 agent 会话——它们也是库里的行,
+        #    agents 动词会把子 session id 打出来供钻取。sessions 列表仍只列顶层。)
+        cur = conn.execute(
+            "SELECT id FROM session WHERE id LIKE ? ORDER BY time_updated DESC",
+            (selector + "%",))
+        ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            cur = conn.execute(
+                "SELECT id FROM session WHERE id LIKE ? ORDER BY time_updated DESC",
+                ("%" + selector + "%",))
+            ids = [r[0] for r in cur.fetchall()]
+        if not ids:
+            raise LookupError(f"无 opencode session 匹配 {selector!r}")
+        if len(ids) > 1:
+            raise LookupError(f"歧义:{len(ids)} 个 opencode session 匹配 {selector!r}: "
+                              f"{', '.join(ids[:8])}")
+        return _opencode_session_files(ids[0], conn=conn)
+    finally:
+        conn.close()
+
+
+def _opencode_norm_input(tool: str, inp):
+    """opencode camelCase 输入 → Claude snake_case;apply_patch 取 patchText 字符串。
+    使 ccq 的 _file_path_of / _seq_churn / _parse_apply_patch 零改动复用。"""
+    if tool == "apply_patch":
+        if isinstance(inp, dict):
+            return inp.get("patchText") or ""
+        return inp
+    if isinstance(inp, dict):
+        return {_OPENCODE_FIELD_MAP.get(k, k): v for k, v in inp.items()}
+    return inp
+
+
+def _opencode_ts(ms) -> Optional[str]:
+    """毫秒 epoch → ISO 时间戳(ccq 的 _hhmm / epoch 解析用)。"""
+    if not ms:
+        return None
+    from datetime import datetime
+    try:
+        return datetime.fromtimestamp(ms / 1000).isoformat()
+    except Exception:
+        return None
+
+
+def parse_opencode_events(session_id_or_path: str | Path,
+                          agent_type: Optional[str] = None,
+                          agent_id: Optional[str] = None) -> list[Event]:
+    """把一个 opencode session(库里的 messages + parts)解析成与 parse_events 同构
+    的 Event 列表,使 overview / timeline / tools / errors / files / agents /
+    skills / 查询 DSL 等动词可直接复用。
+
+    session_id_or_path:session id 字符串,或 Path(取 .name 作 id;子 agent 的
+    SubAgent.path 即此形式)。agent_type/agent_id:子 agent 作用域标注(主会话为 None)。
+
+    每个 tool part 拆成 TOOL(调用)+ RESULT(结果)两条事件,以 tool_use_id
+    (= callID)关联——与 Claude 的 tool_use/tool_result 双事件口径对齐,使
+    errors / name=... is_error=1 / files 分类等逻辑零改动复用。
+    token 取 message 级(挂在每条 assistant 消息的首个事件上,与 Claude 一致)。
+
+    用户 /slash 触发:opencode 把 skill 内容注入到用户消息 text part 开头,用户
+    的 /command 行附在末尾。抽掉前导注入内容只保留 /command 起的段作为 HUMAN 文本
+    (使 sessions 速览 / skill-report 意图干净可读;注入内容仍在 raw 里)。
+    """
+    sid = (Path(session_id_or_path).name
+           if isinstance(session_id_or_path, Path) else session_id_or_path)
+    conn = _opencode_conn()
+    try:
+        # 拉一条消息+分片联合流,按 (消息时间, 分片时间, 分片 id) 全序
+        cur = conn.execute(
+            "SELECT m.id, m.data, p.id, p.data, p.time_created "
+            "FROM message m JOIN part p ON p.message_id = m.id "
+            "WHERE m.session_id = ? "
+            "ORDER BY m.time_created, p.time_created, p.id", (sid,))
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    events: list[Event] = []
+    seq = 0
+    prev_msg_id: str | None = None
+    msg_tok = Token()
+    first_of_msg = True
+    for mid, mdata, pid, pdata, ptime in rows:
+        try:
+            mo = json.loads(mdata) if mdata else {}
+        except Exception:
+            mo = {}
+        try:
+            po = json.loads(pdata) if pdata else {}
+        except Exception:
+            po = {}
+        role = mo.get("role")
+        ptype = po.get("type")
+        ts = _opencode_ts(ptime or (mo.get("time") or {}).get("created"))
+        common = dict(ts=ts, sidechain=agent_id is not None,
+                      agent_type=agent_type, agent_id=agent_id,
+                      uuid=pid, parent_uuid=mid, raw=po)
+
+        # 消息边界:新消息的首个 assistant 事件挂 message 级 token(与 Claude 一致)
+        if mid != prev_msg_id:
+            t = mo.get("tokens") or {}
+            cache = t.get("cache") or {}
+            msg_tok = Token(
+                input=t.get("input", 0) or 0,
+                output=t.get("output", 0) or 0,
+                cache_read=cache.get("read", 0) or 0,
+                cache_write=cache.get("write", 0) or 0,
+                thinking=t.get("reasoning", 0) or 0,
+            )
+            first_of_msg = True
+            prev_msg_id = mid
+        tok_here = msg_tok if (first_of_msg and role == "assistant") else Token()
+
+        if ptype == "text":
+            txt = (po.get("text") or "").replace("\r\n", "\n").replace("\r", "\n")
+            if not txt.strip():
+                continue
+            if role == "user":
+                # opencode 按用户请求匹配 skill 触发描述后,自动把整段 SKILL.md
+                # 注入到用户 text part 开头(非用户手敲 /slash,也非用户粘贴)。
+                # 注入内容以 "Base directory for this skill: <path>\nRelative
+                # paths in this skill ... base directory." footer 收尾,其后才是
+                # 用户真实输入。优先按 footer 切分(skill 名取路径末段);footer
+                # 之后若以 /command 开头,则用户是显式 /slash 触发(用该名而非
+                # 注入 skill 名);skill 无此 footer 时退回 /command 行启发。
+                fms = list(_OPENCODE_SKILL_FOOTER.finditer(txt))
+                if fms:
+                    fm = fms[-1]
+                    injected_skill = Path(fm.group(1).strip()).name or ""
+                    genuine = txt[fm.end():].strip()
+                    # footer 之后若以 /command 开头 → 用户的显式 /slash 触发优先
+                    cm = _SLASH_RE.match(genuine) if genuine else None
+                    trigger = cm.group(1) if cm else injected_skill
+                    if trigger:
+                        seq += 1
+                        events.append(Event(seq, Kind.SKILL, text=trigger,
+                                            tool_use_id=pid, **common))
+                    if genuine:
+                        seq += 1
+                        events.append(Event(seq, Kind.HUMAN, text=genuine,
+                                            tokens=Token(), **common))
+                else:
+                    # 无 footer:退回 /command 行启发(skill 无 footer,或无注入)
+                    matches = list(_SLASH_RE.finditer(txt))
+                    split_at = matches[-1].start() if matches else -1
+                    if split_at > 0:
+                        genuine = txt[split_at:].strip()
+                        seq += 1
+                        events.append(Event(seq, Kind.SKILL, text=matches[-1].group(1),
+                                            tool_use_id=pid, **common))
+                        seq += 1
+                        events.append(Event(seq, Kind.HUMAN, text=genuine,
+                                            tokens=Token(), **common))
+                    else:
+                        # 整段都是真实用户输入;/command 在首行时额外发一条 SKILL
+                        if matches:
+                            seq += 1
+                            events.append(Event(seq, Kind.SKILL, text=matches[0].group(1),
+                                                tool_use_id=pid, **common))
+                        seq += 1
+                        events.append(Event(seq, Kind.HUMAN, text=txt,
+                                            tokens=Token(), **common))
+            else:  # assistant
+                seq += 1
+                events.append(Event(seq, Kind.AGENT, text=txt,
+                                    tokens=tok_here, **common))
+                first_of_msg = False
+        elif ptype == "reasoning":
+            txt = po.get("text") or ""
+            if txt.strip():
+                seq += 1
+                events.append(Event(seq, Kind.THINKING, text=txt, **common))
+        elif ptype == "tool":
+            tool = po.get("tool") or "unknown"
+            name = _OPENCODE_TOOL_MAP.get(tool, tool)
+            st = po.get("state") or {}
+            inp = _opencode_norm_input(tool, st.get("input"))
+            cid = po.get("callID") or pid
+            status = st.get("status") or ""
+            is_err = status == "error"
+            # Skill 工具:额外发一条 SKILL 事件(与 Claude 侧 Skill 工具一致)
+            if name == "Skill":
+                sname = (st.get("input") or {}).get("name") or ""
+                if sname:
+                    seq += 1
+                    events.append(Event(seq, Kind.SKILL, text=sname,
+                                        tool_use_id=cid, **common))
+            # TOOL 事件(调用)
+            seq += 1
+            events.append(Event(seq, Kind.TOOL, text=name,
+                                tool_name=name, tool_input=inp,
+                                tool_use_id=cid, tokens=tok_here, **common))
+            first_of_msg = False
+            # RESULT 事件(结果;同 part 拆出,tool_use_id 关联)
+            out_txt = st.get("error") if is_err else st.get("output")
+            if out_txt is None:
+                out_txt = ""
+            if not isinstance(out_txt, str):
+                out_txt = json.dumps(out_txt, ensure_ascii=False)
+            seq += 1
+            events.append(Event(seq, Kind.RESULT, text=(out_txt or "")[:4000],
+                                tool_use_id=cid, is_error=is_err, **common))
+        elif ptype == "compaction":
+            seq += 1
+            events.append(Event(seq, Kind.SUMMARY, text="compaction", **common))
+        # step-start / step-finish / patch / file:不产事件(token 已在 message 级)
     return events
